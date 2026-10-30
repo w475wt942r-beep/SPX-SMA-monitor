@@ -1,1 +1,173 @@
 
+name: SPX SMA Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas
+
+      - name: Run SPX SMA analysis
+        shell: bash
+        run: |
+          cat > /tmp/spx_monitor.py <<'PY'
+          import sys
+          import pandas as pd
+          import yfinance as yf
+
+          PERIODS = [10, 20, 30, 40, 50]
+          TIMEFRAMES = [1, 5, 10, 20]
+
+          data = yf.download(
+              "^GSPC",
+              period="5d",
+              interval="1m",
+              auto_adjust=True,
+              progress=False
+          )
+
+          if data.empty:
+              sys.exit("No SPX market data available.")
+
+          close = data["Close"]
+          if isinstance(close, pd.DataFrame):
+              close = close.iloc[:, 0]
+
+          close.index = pd.to_datetime(close.index)
+          if close.index.tz is None:
+              close.index = close.index.tz_localize(
+                  "America/New_York"
+              )
+          else:
+              close.index = close.index.tz_convert(
+                  "America/New_York"
+              )
+
+          close = close.between_time(
+              "09:30", "15:59"
+          ).dropna()
+
+          if close.empty:
+              sys.exit("No regular-session data available.")
+
+          results = {}
+
+          for minutes in TIMEFRAMES:
+              values = []
+
+              for day, group in close.groupby(
+                  close.index.date
+              ):
+                  sampled = group.resample(
+                      f"{minutes}min",
+                      origin="start_day",
+                      offset="9h30min",
+                      label="left",
+                      closed="left"
+                  ).last().dropna()
+
+                  values.append(sampled)
+
+              series = pd.concat(values).sort_index()
+
+              # Exclude the current incomplete candle.
+              now = pd.Timestamp.now(
+                  tz="America/New_York"
+              )
+              if not series.empty:
+                  last_start = series.index[-1]
+                  if last_start + pd.Timedelta(
+                      minutes=minutes
+                  ) > now:
+                      series = series.iloc[:-1]
+
+              if len(series) < max(PERIODS) + 2:
+                  results[minutes] = ["N/A"] * 5
+                  continue
+
+              directions = []
+
+              for period in PERIODS:
+                  sma = series.rolling(period).mean()
+
+                  current = sma.iloc[-1]
+                  previous = sma.iloc[-2]
+
+                  if pd.isna(current) or pd.isna(previous):
+                      direction = "N/A"
+                  elif current > previous:
+                      direction = "GREEN"
+                  elif current < previous:
+                      direction = "RED"
+                  else:
+                      direction = "FLAT"
+
+                  directions.append(direction)
+
+              results[minutes] = directions
+
+          print("\nSPX SMA ALIGNMENT REPORT")
+          print("GREEN = rising | RED = falling")
+          print("Based on most recent completed candles\n")
+
+          print(
+              f"{'SMA':<8}"
+              f"{'1m':<10}"
+              f"{'5m':<10}"
+              f"{'10m':<10}"
+              f"{'20m':<10}"
+          )
+
+          for i, period in enumerate(PERIODS):
+              print(
+                  f"{period:<8}"
+                  + "".join(
+                      f"{results[tf][i]:<10}"
+                      for tf in TIMEFRAMES
+                  )
+              )
+
+          print("\nALIGNMENT SUMMARY")
+
+          for tf in TIMEFRAMES:
+              directions = results[tf]
+              green = directions.count("GREEN")
+              red = directions.count("RED")
+
+              if green == 5:
+                  status = "FULL BULLISH ALIGNMENT"
+              elif red == 5:
+                  status = "FULL BEARISH ALIGNMENT"
+              else:
+                  status = (
+                      f"{green}/5 rising, {red}/5 falling"
+                  )
+
+              print(f"{tf}m: {status}")
+
+          print("\nNote: SMA slopes only.")
+          print("This does not verify SMA value ordering.")
+          PY
+
+          python /tmp/spx_monitor.py
