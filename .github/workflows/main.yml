@@ -12,7 +12,7 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -25,10 +25,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install yfinance pandas
+          python -m pip install "pandas>=2.2,<3" "yfinance>=0.2.50"
 
-      - name: Run SPX SMA analysis
+      - name: Analyze SPX SMA charts
         shell: bash
         run: |
           cat > /tmp/spx_monitor.py <<'PY'
@@ -36,87 +35,115 @@ jobs:
           import pandas as pd
           import yfinance as yf
 
-          PERIODS = [10, 20, 30, 40, 50]
-          TIMEFRAMES = [1, 5, 10, 20]
+          SYMBOL = "^GSPC"
+          TZ = "America/New_York"
+          PERIODS = [5, 10, 20, 30, 40, 50]
 
-          data = yf.download(
-              "^GSPC",
-              period="5d",
-              interval="1m",
-              auto_adjust=True,
-              progress=False
-          )
+          CHARTS = [
+              ("1D:1m", "5d", "1m", 1),
+              ("5D:1m", "5d", "1m", 5),
+              ("10D:5m", "10d", "5m", 10),
+              ("20D:1h", "1mo", "60m", 20),
+          ]
 
-          if data.empty:
-              sys.exit("No SPX market data available.")
+          now = pd.Timestamp.now(tz=TZ)
+          cache = {}
 
-          close = data["Close"]
-          if isinstance(close, pd.DataFrame):
-              close = close.iloc[:, 0]
+          def download_prices(period, interval):
+              key = (period, interval)
 
-          close.index = pd.to_datetime(close.index)
-          if close.index.tz is None:
-              close.index = close.index.tz_localize(
-                  "America/New_York"
+              if key in cache:
+                  return cache[key]
+
+              data = yf.download(
+                  SYMBOL,
+                  period=period,
+                  interval=interval,
+                  auto_adjust=False,
+                  progress=False,
+                  threads=False
               )
-          else:
-              close.index = close.index.tz_convert(
-                  "America/New_York"
-              )
 
-          close = close.between_time(
-              "09:30", "15:59"
-          ).dropna()
+              if data.empty:
+                  cache[key] = pd.Series(dtype=float)
+                  return cache[key]
 
-          if close.empty:
-              sys.exit("No regular-session data available.")
+              close = data["Close"]
+
+              if isinstance(close, pd.DataFrame):
+                  close = close.iloc[:, 0]
+
+              close.index = pd.to_datetime(close.index)
+
+              if close.index.tz is None:
+                  close.index = close.index.tz_localize(TZ)
+              else:
+                  close.index = close.index.tz_convert(TZ)
+
+              cache[key] = close.sort_index().dropna()
+              return cache[key]
+
+          def prepare_bars(source, interval, days):
+              if source.empty:
+                  return source
+
+              source = source.between_time("09:30", "15:59")
+
+              if source.empty:
+                  return source
+
+              sessions = sorted(set(source.index.date))
+              selected = set(sessions[-days:])
+
+              source = source[
+                  [d in selected for d in source.index.date]
+              ]
+
+              minutes = 60 if interval == "60m" else int(interval[:-1])
+
+              if minutes == 60:
+                  # Hourly chart anchored to 9:30 AM ET.
+                  # Yahoo's 60-minute bars are already aggregated.
+                  # Do not resample their closing prices again.
+                  pass
+
+              # Exclude an incomplete current candle.
+              if (
+                  now.weekday() < 5
+                  and now.hour >= 9
+                  and now.hour < 16
+              ):
+                  current = source.index.date == now.date()
+
+                  incomplete = (
+                      source.index
+                      + pd.Timedelta(minutes=minutes)
+                      > now
+                  )
+
+                  source = source[~(current & incomplete)]
+
+              return source
 
           results = {}
 
-          for minutes in TIMEFRAMES:
-              values = []
-
-              for day, group in close.groupby(
-                  close.index.date
-              ):
-                  sampled = group.resample(
-                      f"{minutes}min",
-                      origin="start_day",
-                      offset="9h30min",
-                      label="left",
-                      closed="left"
-                  ).last().dropna()
-
-                  values.append(sampled)
-
-              series = pd.concat(values).sort_index()
-
-              # Exclude the current incomplete candle.
-              now = pd.Timestamp.now(
-                  tz="America/New_York"
-              )
-              if not series.empty:
-                  last_start = series.index[-1]
-                  if last_start + pd.Timedelta(
-                      minutes=minutes
-                  ) > now:
-                      series = series.iloc[:-1]
-
-              if len(series) < max(PERIODS) + 2:
-                  results[minutes] = ["N/A"] * 5
-                  continue
+          for label, period, interval, days in CHARTS:
+              prices = download_prices(period, interval)
+              series = prepare_bars(prices, interval, days)
 
               directions = []
 
-              for period in PERIODS:
-                  sma = series.rolling(period).mean()
+              for length in PERIODS:
+                  if len(series) < length + 1:
+                      directions.append("N/A")
+                      continue
+
+                  sma = series.rolling(length).mean()
 
                   current = sma.iloc[-1]
                   previous = sma.iloc[-2]
 
-                  if pd.isna(current) or pd.isna(previous):
-                      direction = "N/A"
-                  elif current > previous:
+                  if current > previous:
                       direction = "GREEN"
                   elif current < previous:
                       direction = "RED"
@@ -125,49 +152,81 @@ jobs:
 
                   directions.append(direction)
 
-              results[minutes] = directions
+              results[label] = directions
+
+              latest = (
+                  str(series.index[-1])
+                  if len(series)
+                  else "Unavailable"
+              )
+
+              print(
+                  f"{label}: {len(series)} bars, "
+                  f"latest = {latest}"
+              )
+
+          labels = [chart[0] for chart in CHARTS]
 
           print("\nSPX SMA ALIGNMENT REPORT")
-          print("GREEN = rising | RED = falling")
-          print("Based on most recent completed candles\n")
+          print("GREEN = Rising | RED = Falling")
+          print("Based on completed candles\n")
 
           print(
               f"{'SMA':<8}"
-              f"{'1m':<10}"
-              f"{'5m':<10}"
-              f"{'10m':<10}"
-              f"{'20m':<10}"
+              + "".join(f"{label:<14}" for label in labels)
           )
 
-          for i, period in enumerate(PERIODS):
+          for i, length in enumerate(PERIODS):
               print(
-                  f"{period:<8}"
+                  f"{length:<8}"
                   + "".join(
-                      f"{results[tf][i]:<10}"
-                      for tf in TIMEFRAMES
+                      f"{results[label][i]:<14}"
+                      for label in labels
                   )
               )
 
           print("\nALIGNMENT SUMMARY")
 
-          for tf in TIMEFRAMES:
-              directions = results[tf]
+          for label in labels:
+              directions = results[label]
+
               green = directions.count("GREEN")
               red = directions.count("RED")
 
-              if green == 5:
+              if green == 6:
                   status = "FULL BULLISH ALIGNMENT"
-              elif red == 5:
+              elif red == 6:
                   status = "FULL BEARISH ALIGNMENT"
               else:
                   status = (
-                      f"{green}/5 rising, {red}/5 falling"
+                      f"{green}/6 rising, "
+                      f"{red}/6 falling"
                   )
 
-              print(f"{tf}m: {status}")
+              print(f"{label}: {status}")
 
-          print("\nNote: SMA slopes only.")
-          print("This does not verify SMA value ordering.")
+          print("\nCROSS-CHART ALIGNMENT")
+
+          if all(
+              results[label].count("GREEN") == 6
+              for label in labels
+          ):
+              print("ALL FOUR CHARTS BULLISH")
+
+          elif all(
+              results[label].count("RED") == 6
+              for label in labels
+          ):
+              print("ALL FOUR CHARTS BEARISH")
+
+          else:
+              print("NO COMPLETE FOUR-CHART ALIGNMENT")
+
+          print("\nNotes:")
+          print("SMA slope only, not SMA stacking.")
+          print("N/A means insufficient price history.")
+          print("The 1-day chart uses today's session only.")
+          print("Longer charts use their selected history.")
           PY
 
           python /tmp/spx_monitor.py
